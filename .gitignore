@@ -1,0 +1,14 @@
+# Ignore everything by default
+*
+
+# Allow the specific files required for the project
+!docker-update.sh
+!README.md
+!LICENSE
+!.gitignore
+
+# Ignore any hidden system or IDE files that might be created later
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
