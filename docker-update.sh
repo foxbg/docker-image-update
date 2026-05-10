@@ -6,7 +6,7 @@
 set -e
 
 # --- Defaults & Variables ---
-VERSION="1.1.0"
+VERSION="1.2.0"
 MODE="check"
 DRY_RUN=false
 
@@ -49,12 +49,16 @@ get_remote_config_digest() {
     case $arch in
         x86_64) arch="amd64" ;;
         aarch64) arch="arm64" ;;
-        armv7l) arch="arm" ;;
+        armv7l|armv6l) arch="arm" ;;
+        i386|i686) arch="386" ;;
+        ppc64le) arch="ppc64le" ;;
+        s390x) arch="s390x" ;;
     esac
 
     # Capture manifest and any error messages
     local manifest_verbose
     manifest_verbose=$(docker manifest inspect --verbose "$image" 2>&1) || {
+        # Check specifically for rate limiting
         if echo "$manifest_verbose" | grep -qi "toomanyrequests"; then
             echo "RATE_LIMIT_REACHED"
             return
@@ -62,16 +66,20 @@ get_remote_config_digest() {
         return
     }
 
-    # Find the config digest for the current architecture
+    # Extraction Logic:
+    # 1. Find the block for our architecture.
+    # 2. Look for the 'config' section within that block.
+    # 3. Grab the digest. 
+    # Using -A 50 to give more breathing room for large multi-arch manifests.
     local config_digest=$(echo "$manifest_verbose" | \
-        grep -A 30 "\"architecture\": \"$arch\"" | \
-        grep -A 10 "\"config\":" | \
+        grep -A 50 "\"architecture\": \"$arch\"" | \
+        grep -A 15 "\"config\":" | \
         grep "\"digest\":" | head -n 1 | sed -E 's/.*"(sha256:[a-f0-9]+)".*/\1/')
 
-    # Fallback for single-arch images
+    # Fallback for single-architecture images (manifest might not have nested list)
     if [ -z "$config_digest" ]; then
         config_digest=$(echo "$manifest_verbose" | \
-            grep -A 15 "\"config\":" | \
+            grep -A 20 "\"config\":" | \
             grep "\"digest\":" | head -n 1 | sed -E 's/.*"(sha256:[a-f0-9]+)".*/\1/')
     fi
 
@@ -156,9 +164,40 @@ log "Scanning running containers..."
 # List all running containers and their images
 # Use process substitution to avoid subshell so we can update variables directly
 UPDATES_FOUND=0
-while IFS=$'\t' read -r container_id image; do
-    # Get the local Image ID (which is the local config digest)
-    local_config_id=$(docker inspect "$image" --format '{{.Id}}' 2>/dev/null || true)
+while IFS=$'\t' read -r container_id image_raw; do
+    image="$image_raw"
+    
+    # Resolve image ID to name if necessary
+    if [[ "$image" =~ ^[0-9a-f]{12,64}$ ]]; then
+        # Try to get the image name from Compose labels first
+        image_name=$(docker inspect "$container_id" --format '{{ index .Config.Labels "com.docker.compose.image" }}' 2>/dev/null || true)
+        if [ -n "$image_name" ]; then
+            image="$image_name"
+        else
+            # Fallback: try to find any tag for this image ID
+            image_name=$(docker image inspect "$image_raw" --format '{{if .RepoTags}}{{index .RepoTags 0}}{{end}}' 2>/dev/null || true)
+            if [ -n "$image_name" ] && [ "$image_name" != "<none>:<none>" ]; then
+                image="$image_name"
+            fi
+        fi
+    fi
+
+    # If it's still an ID or <none>:<none>, it's local or untagged and cannot be checked remotely
+    if [[ "$image" =~ ^[0-9a-f]{12,64}$ ]] || [ "$image" = "<none>:<none>" ]; then
+        log "Skipping $container_id: Image is local-only or untagged ($image)."
+        continue
+    fi
+
+    # Check if the image has a registry association (RepoDigests)
+    # Locally built images won't have this, so we can't reliably check them against a registry
+    repo_digests=$(docker image inspect "$image_raw" --format '{{.RepoDigests}}' 2>/dev/null || echo "[]")
+    if [ "$repo_digests" = "[]" ] || [ -z "$repo_digests" ]; then
+        log "Skipping $image: Image appears to be locally built or has no registry association."
+        continue
+    fi
+
+    # Get the local Image ID (the local config digest)
+    local_config_id=$(docker inspect "$image_raw" --format '{{.Id}}' 2>/dev/null || true)
     
     # Get the remote config digest
     remote_config_id=$(get_remote_config_digest "$image")
@@ -169,17 +208,18 @@ while IFS=$'\t' read -r container_id image; do
     fi
     
     if [ -z "$remote_config_id" ] || [ -z "$local_config_id" ]; then
-        log "Skipping $image: Could not retrieve remote manifest. Ensure the image name is correct."
+        log "Skipping $image: Could not retrieve remote manifest. This image might be local-only or private."
         continue
     fi
 
     if [ "$local_config_id" != "$remote_config_id" ]; then
-        log "UPDATE AVAILABLE: $image (Local: ${local_config_id:7:12}, Remote: ${remote_config_id:7:12})"
+        log "UPDATE AVAILABLE: $image"
         UPDATES_FOUND=$((UPDATES_FOUND + 1))
         
         if [ "$MODE" = "apply" ]; then
             is_compose=$(docker inspect "$container_id" --format '{{ if index .Config.Labels "com.docker.compose.project" }}true{{else}}false{{end}}')
-            update_container "$container_id" "$image" "$is_compose"
+            # Run update in a way that doesn't crash the script on individual failure
+            update_container "$container_id" "$image" "$is_compose" || log "Error: Failed to update $image."
         fi
     else
         if [ "$MODE" = "check" ]; then
